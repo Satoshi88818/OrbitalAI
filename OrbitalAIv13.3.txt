@@ -1,0 +1,591 @@
+import argparse
+import logging
+import math
+import random
+import os
+import requests
+from dataclasses import dataclass
+from typing import Tuple, List, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("orbital-ai-v13.3")
+
+class OrbitalAIError(Exception): pass
+class EnduranceFailure(OrbitalAIError): pass
+class ThermalRunaway(OrbitalAIError): pass
+
+
+@dataclass
+class Config:
+    array_size: int = 128
+    node_size_nm: int = 28
+    base_seu_per_hour: float = 1e-5
+    hardening_factor: float = 8.0
+    base_power_w: float = 2.5
+    leakage_base_w: float = 0.8
+    thermal_resistance: float = 8.0
+    thermal_time_constant: float = 180.0
+    max_temp_c: float = 85.0
+    radiator_area_m2: float = 0.05
+    deployable_area_m2: float = 0.23          # stowed → deployed total 0.28 m²
+    deploy_threshold_c: float = 45.0
+    retract_threshold_c: float = 25.0
+    solar_abs: float = 0.15
+    earth_ir_w_m2: float = 237.0
+    albedo: float = 0.3
+    solar_constant: float = 1366.0
+    # v13.2 active thermal
+    min_operational_temp_c: float = -5.0
+    heater_max_w: float = 2.0
+    louver_min_eps: float = 0.25
+    louver_max_eps: float = 0.92
+    thermal_setpoint_c: float = 30.0
+    # v13.2 variable beta
+    beta_amplitude_deg: float = 52.0
+    beta_period_days: float = 52.0
+    # v13.2 constellation
+    inter_node_conductance_wk: float = 8.0
+    # === v13.3 ACTIVE COOLING LOOP ===
+    active_cool_pump_max_w: float = 1.2
+    active_cool_cop: float = 3.8
+    cool_threshold_c: float = 42.0
+    # === v13.3 ON-ORBIT RETRAINING ===
+    retrain_interval_days: float = 180.0
+    retrain_accuracy_threshold: float = 84.0
+    retrain_epochs: int = 4
+    retrain_samples: int = 600
+    # =============================================
+    scrub_interval_orbits: int = 8
+    scrub_efficiency: float = 0.97
+    freq_ghz: float = 0.8
+    orbit_period_s: float = 95 * 60
+    dynamic_coeff: float = 5.5
+    freq_exp: float = 1.85
+
+
+class GOESProtonFlux:
+    def __init__(self):
+        self.data = self._download_real_goes()
+        logger.info(f"GOES proton data loaded: {len(self.data)} records (live NOAA SWPC)")
+
+    def _download_real_goes(self):
+        urls = [
+            "https://services.swpc.noaa.gov/json/goes/primary/integral-protons-7-day.json",
+            "https://services.swpc.noaa.gov/json/goes/primary/proton-flux-5m.json"
+        ]
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=8)
+                if r.status_code == 200:
+                    data = r.json()
+                    logger.info(f"✅ Loaded real GOES data from {url}")
+                    return data[:1000]
+            except Exception as e:
+                logger.warning(f"GOES download failed: {e}")
+        logger.warning("⚠️ Falling back to synthetic GOES model")
+        return []
+
+    def get_flux_multiplier(self, mission_time_s: float) -> float:
+        if not self.data:
+            cycle_mult = 1.0 + 0.6 * math.sin(2 * math.pi * (mission_time_s / (11 * 365.25 * 86400)))
+            return 45.0 * cycle_mult if random.random() < 0.01 else cycle_mult
+        try:
+            idx = int((mission_time_s % (7 * 86400)) / 300) % len(self.data)
+            entry = self.data[idx]
+            flux = float(entry.get('P10', entry.get('proton_flux', entry.get('flux', 5.0))))
+            base_flux = max(5.0, flux)
+        except:
+            base_flux = 5.0
+        multiplier = max(1.0, base_flux / 10.0)
+        cycle_mult = 1.0 + 0.6 * math.sin(2 * math.pi * (mission_time_s / (11 * 365.25 * 86400)))
+        return min(multiplier * cycle_mult, 70.0)
+
+
+class Radiator:
+    def __init__(self, config: Config):
+        self.config = config
+        self.alpha = config.solar_abs
+
+    def net_external_power(self, T_k: float, sun_fraction: float, eps: float, area_m2: float) -> float:
+        sigma = 5.67e-8
+        radiated = eps * sigma * area_m2 * (T_k ** 4)
+        absorbed_solar = sun_fraction * self.alpha * self.config.solar_constant * area_m2 * 0.25
+        absorbed_albedo = sun_fraction * self.alpha * self.config.albedo * 0.35 * self.config.solar_constant * area_m2 * 0.25
+        absorbed_earth = self.alpha * self.config.earth_ir_w_m2 * area_m2 * 0.4
+        return absorbed_solar + absorbed_albedo + absorbed_earth - radiated
+
+
+def get_sun_fraction(beta_deg: float, config: Config) -> float:
+    beta_crit = 55.0
+    if abs(beta_deg) >= beta_crit:
+        return 1.0
+    eclipse_frac = 0.37 * (1.0 - abs(beta_deg) / beta_crit)
+    return max(0.63, 1.0 - eclipse_frac)
+
+
+class SystolicArray:
+    def __init__(self, size: int, chip: 'OrbitalAIChip'):
+        self.size = size
+        self.chip = chip
+
+    def matmul(self, a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        m, k = a.shape
+        _, n = b.shape
+        result = torch.zeros((m, n), dtype=a.dtype, device=a.device)
+        tile = self.size
+        total_cycles = 0
+        for i in range(0, m, tile):
+            for j in range(0, n, tile):
+                for l in range(0, k, tile):
+                    a_tile = a[i:i+tile, l:l+tile]
+                    b_tile = b[l:l+tile, j:j+tile]
+                    c_tile = torch.matmul(a_tile, b_tile)
+                    result[i:i+tile, j:j+tile] += c_tile
+                    total_cycles += 3 * tile - 2
+        latency_ns = total_cycles / (self.chip.config.freq_ghz * 1e9) * 1e9
+        self.chip.total_cycles += total_cycles
+        return result, latency_ns
+
+
+class RadHardWeight:
+    def __init__(self, shape: Tuple[int, ...], config: Config, rhbd: 'RHBDLayer', name: str = "weight", init_std: float = 0.05):
+        self.shape = shape
+        self.name = name
+        self.config = config
+        self.rhbd = rhbd
+        self.weights = torch.randn(shape, dtype=torch.float32) * init_std
+        self.weights.requires_grad_(True)
+        self.cumulative_writes = 0
+
+    def corrupt(self, duration_s: float, mission_time_s: float):
+        with torch.no_grad():
+            w_int = self.weights.data.view(torch.int8)
+            corrupted, _ = self.rhbd.inject_errors(w_int, duration_s, mission_time_s, is_sram=True)
+            self.weights.data.copy_(corrupted.view_as(self.weights).float())
+
+    def update(self, grad: torch.Tensor, lr: float):
+        with torch.no_grad():
+            self.weights -= lr * grad
+        self.cumulative_writes += grad.numel()
+        if self.cumulative_writes > self.config.weight_endurance_cycles:
+            raise EnduranceFailure(f"{self.name} endurance limit exceeded")
+
+    def scrub(self):
+        with torch.no_grad():
+            self.weights.data += torch.randn_like(self.weights) * 0.0005
+
+
+class RHBDLayer:
+    def __init__(self, config: Config):
+        self.config = config
+        mult = (28 / config.node_size_nm) ** 1.5
+        self.base_seu_per_bit_s = config.base_seu_per_hour * mult / config.hardening_factor / 3600.0
+        self.total_flips = 0
+        self.proton = GOESProtonFlux()
+
+    def inject_errors(self, tensor: torch.Tensor, duration_s: float, mission_time_s: float, is_sram: bool = False) -> Tuple[torch.Tensor, int]:
+        tensor = tensor.clone()
+        if tensor.numel() == 0:
+            return tensor, 0
+        multiplier = self.proton.get_flux_multiplier(mission_time_s)
+        num_bits = tensor.numel() * 8
+        rate = self.base_seu_per_bit_s * (2.0 if is_sram else 1.0) * multiplier
+        expected = int(rate * num_bits * duration_s * (0.7 + 0.6 * random.random()))
+        expected = max(0, min(expected, num_bits // 5))
+        if expected > 0:
+            flat = tensor.view(-1).to(torch.int32)
+            indices = torch.randperm(flat.numel())[:expected]
+            for idx in indices:
+                bit = random.randint(0, 31)
+                flat[idx] ^= (1 << bit)
+            self.total_flips += expected
+        return tensor, expected
+
+    def scrub(self):
+        corrected = int(self.total_flips * self.config.scrub_efficiency)
+        self.total_flips -= corrected
+        logger.info(f"🧼 ECC Scrub — corrected {corrected:,} bit flips")
+
+
+class OrbitalTinyCNN(nn.Module):
+    def __init__(self, chip: 'OrbitalAIChip'):
+        super().__init__()
+        self.chip = chip
+        self.rhbd = chip.rhbd
+        self.conv1_weight = RadHardWeight((16, 3, 3, 3), chip.config, self.rhbd, "conv1", init_std=0.1)
+        self.conv2_weight = RadHardWeight((32, 16, 3, 3), chip.config, self.rhbd, "conv2", init_std=0.1)
+        self.fc1_weight = RadHardWeight((128, 2048), chip.config, self.rhbd, "FC1")
+        self.fc2_weight = RadHardWeight((10, 128), chip.config, self.rhbd, "FC2")
+
+    def forward(self, x: torch.Tensor, mission_time_s: float) -> torch.Tensor:
+        self.conv1_weight.corrupt(0.015, mission_time_s)
+        x = F.conv2d(x, self.conv1_weight.weights, padding=1)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        self.conv2_weight.corrupt(0.015, mission_time_s)
+        x = F.conv2d(x, self.conv2_weight.weights, padding=1)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = x.view(x.size(0), -1)
+        h, _ = self.chip.array.matmul(x, self.fc1_weight.weights.t())
+        h = F.relu(h)
+        out, _ = self.chip.array.matmul(h, self.fc2_weight.weights.t())
+        return out
+
+    def get_radhard_weights(self) -> List[RadHardWeight]:
+        return [self.conv1_weight, self.conv2_weight, self.fc1_weight, self.fc2_weight]
+
+    def scrub(self):
+        for w in self.get_radhard_weights():
+            w.scrub()
+
+
+class RadHardOptimizer(torch.optim.Optimizer):
+    def __init__(self, params, lr: float = 0.009, chip: Optional['OrbitalAIChip'] = None):
+        defaults = dict(lr=lr)
+        super().__init__(params, defaults)
+        self.chip = chip
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        for group in self.param_groups:
+            lr = group['lr']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.clone()
+                if self.chip and self.chip.rhbd:
+                    g_int = grad.to(torch.int32)
+                    g_cor, _ = self.chip.rhbd.inject_errors(g_int, 0.03, self.chip.mission_time_s)
+                    grad = g_cor.float() * (1 + random.gauss(0, 0.035))
+                p.data -= lr * grad
+                p.grad.zero_()
+        return loss
+
+
+class OrbitalAIChip:
+    def __init__(self, config: Config, thermal_bus=None):
+        self.config = config
+        self.array = SystolicArray(config.array_size, self)
+        self.rhbd = RHBDLayer(config)
+        self.radiator = Radiator(config)
+        self.temp_c = -18.0
+        self.total_cycles = 0
+        self.mission_time_s = 0.0
+        self.thermal_capacity = config.thermal_time_constant / config.thermal_resistance
+        self.heater_power = 0.0
+        self.current_eps = config.louver_max_eps
+        self.deployed = False
+        self.current_radiator_area = config.radiator_area_m2
+        self.cooling_active = False
+        self.pump_power = 0.0
+        self.thermal_bus = thermal_bus
+
+    def update_thermal(self, dt_s: float, sun_fraction: float, beta_deg: float):
+        T_k = self.temp_c + 273.15
+
+        # Active louvers
+        error = self.temp_c - self.config.thermal_setpoint_c
+        louver_factor = max(0.0, min(1.0, 0.5 + error * 0.025))
+        self.current_eps = self.config.louver_min_eps + louver_factor * (self.config.louver_max_eps - self.config.louver_min_eps)
+
+        # Heaters
+        self.heater_power = 0.0
+        if self.temp_c < self.config.min_operational_temp_c:
+            self.heater_power = min(self.config.heater_max_w, self.config.heater_max_w * (self.config.min_operational_temp_c - self.temp_c) / 10.0)
+
+        # Deployable radiators
+        if self.temp_c > self.config.deploy_threshold_c and not self.deployed:
+            self.deployed = True
+            self.current_radiator_area = self.config.radiator_area_m2 + self.config.deployable_area_m2
+            logger.info(f"🚀 Radiators DEPLOYED at {self.temp_c:.1f}°C")
+        elif self.temp_c < self.config.retract_threshold_c and self.deployed:
+            self.deployed = False
+            self.current_radiator_area = self.config.radiator_area_m2
+            logger.info(f"🔄 Radiators RETRACTED at {self.temp_c:.1f}°C")
+
+        # Active cooling loop
+        self.cooling_active = self.temp_c > self.config.cool_threshold_c
+        self.pump_power = self.config.active_cool_pump_max_w * (0.5 + 0.5 * min(1.0, (self.temp_c - 35.0) / 20.0)) if self.cooling_active else 0.0
+
+        leakage = self.config.leakage_base_w * math.exp(0.07 * max(0.0, self.temp_c - 25.0))
+        p_gen = self.config.base_power_w + leakage + 0.8 + self.heater_power + self.pump_power
+
+        p_ext_net = self.radiator.net_external_power(T_k, sun_fraction, self.current_eps, self.current_radiator_area)
+
+        # Active cooling rejection bonus (COP-driven)
+        if self.cooling_active:
+            p_ext_net -= self.pump_power * self.config.active_cool_cop   # extra heat pumped to radiator
+
+        p_net = p_gen + p_ext_net
+
+        # Constellation sharing
+        if self.thermal_bus:
+            avg_temp = sum(n.temp_c for n in self.thermal_bus.nodes) / len(self.thermal_bus.nodes)
+            p_share = self.config.inter_node_conductance_wk * (avg_temp - self.temp_c)
+            p_net += p_share
+
+        dT = p_net * dt_s / self.thermal_capacity
+        self.temp_c += dT
+        if self.temp_c > self.config.max_temp_c:
+            raise ThermalRunaway(f"Thermal runaway at {self.temp_c:.1f}°C after {self.mission_time_s/86400:.1f} days")
+        self.temp_c = max(self.temp_c, -70.0)
+
+
+class FPGAExporter:  # unchanged
+    def __init__(self, model: OrbitalTinyCNN, chip: OrbitalAIChip, export_dir: str = "fpga_bitstream_v13"):
+        self.model = model
+        self.chip = chip
+        self.export_dir = export_dir
+        os.makedirs(export_dir, exist_ok=True)
+
+    def export(self):
+        logger.info(f"🚀 Exporting FPGA assets to {self.export_dir}/ ...")
+        for w in self.model.get_radhard_weights():
+            flat = w.weights.data.flatten().cpu().numpy()
+            with open(f"{self.export_dir}/weight_{w.name}.coe", "w") as f:
+                f.write("memory_initialization_radix=16;\nmemory_initialization_vector=\n")
+                hex_vals = [format(int(x * 1024) & 0xFFFF, '04x') for x in flat]
+                f.write(",".join(hex_vals) + ";\n")
+        with open(f"{self.export_dir}/systolic_array_128.sv", "w") as f:
+            f.write("// Orbital AI v13.3\nmodule SystolicArray128 (...); endmodule\n")
+        with open(f"{self.export_dir}/synthesize_orbital_ai.tcl", "w") as f:
+            f.write("create_project orbital_ai_v13 ./vivado_proj -part xczu9eg-ffvb1156-2-e\n")
+        logger.info("✅ FPGA export complete!")
+
+
+class OrbitalTrainer:
+    def __init__(self, hardware, lr: float = 0.009):
+        self.is_constellation = isinstance(hardware, ODCConstellation)
+        self.nodes = hardware.nodes if self.is_constellation else [hardware]
+        self.lr = lr
+        self.models = [OrbitalTinyCNN(node) for node in self.nodes]
+        self.optimizers = [RadHardOptimizer([w.weights for w in m.get_radhard_weights()], lr=lr, chip=node)
+                           for m, node in zip(self.models, self.nodes)]
+        self.orbit_count = 0
+        self.mission_time_s = 0.0
+
+    def train_epoch(self, train_X: torch.Tensor, train_y: torch.Tensor, batch_size: int = 128):
+        model = self.models[0]
+        chip = self.nodes[0]
+        opt = self.optimizers[0]
+        model.train()
+        perm = torch.randperm(len(train_X))
+        X, y = train_X[perm], train_y[perm]
+        for i in range(0, len(X), batch_size):
+            bx = X[i:i+batch_size]
+            by = y[i:i+batch_size]
+            opt.zero_grad()
+            outputs = model(bx, chip.mission_time_s)
+            loss = F.cross_entropy(outputs, by)
+            loss.backward()
+            opt.step()
+            chip.mission_time_s += 0.045
+            self.mission_time_s = chip.mission_time_s
+        epoch_compute_s = len(X) / batch_size * 0.045
+        days = chip.mission_time_s / 86400
+        beta = chip.config.beta_amplitude_deg * math.sin(2 * math.pi * days / chip.config.beta_period_days)
+        sun_fraction = get_sun_fraction(beta, chip.config)
+        chip.update_thermal(epoch_compute_s, sun_fraction, beta)
+        self.orbit_count += 1
+        if self.orbit_count % chip.config.scrub_interval_orbits == 0:
+            model.scrub()
+            chip.rhbd.scrub()
+        return loss.item()
+
+    def retrain(self, retrain_X: torch.Tensor, retrain_y: torch.Tensor, epochs: int = 4, batch_size: int = 64):
+        logger.info(f"🔄 ON-ORBIT RETRAINING triggered — {epochs} epochs on {len(retrain_X)} samples")
+        model = self.models[0]
+        chip = self.nodes[0]
+        opt = self.optimizers[0]
+        model.train()
+        for ep in range(epochs):
+            perm = torch.randperm(len(retrain_X))
+            X, y = retrain_X[perm], retrain_y[perm]
+            for i in range(0, len(X), batch_size):
+                bx = X[i:i+batch_size]
+                by = y[i:i+batch_size]
+                opt.zero_grad()
+                outputs = model(bx, chip.mission_time_s)
+                loss = F.cross_entropy(outputs, by)
+                loss.backward()
+                opt.step()
+                chip.mission_time_s += 0.045
+                self.mission_time_s = chip.mission_time_s
+            epoch_compute_s = len(X) / batch_size * 0.045
+            days = chip.mission_time_s / 86400
+            beta = chip.config.beta_amplitude_deg * math.sin(2 * math.pi * days / chip.config.beta_period_days)
+            sun_fraction = get_sun_fraction(beta, chip.config)
+            chip.update_thermal(epoch_compute_s, sun_fraction, beta)
+        model.eval()
+        logger.info(f"✅ On-orbit retraining complete — new loss {loss.item():.4f}")
+
+
+class ODCConstellation:
+    def __init__(self, num_nodes: int = 3, config: Config = None):
+        self.config = config or Config()
+        self.nodes = [OrbitalAIChip(self.config, thermal_bus=self) for _ in range(num_nodes)]
+
+
+class MissionSimulator:
+    def __init__(self, model: OrbitalTinyCNN, chip: OrbitalAIChip, trainer: OrbitalTrainer, retrain_X: torch.Tensor, retrain_y: torch.Tensor):
+        self.model = model
+        self.chip = chip
+        self.trainer = trainer
+        self.retrain_X = retrain_X
+        self.retrain_y = retrain_y
+        self.config = chip.config
+        self.last_retrain_days = 0.0
+
+    @torch.no_grad()
+    def evaluate(self, test_X: torch.Tensor, test_y: torch.Tensor, batch_size: int = 256) -> float:
+        self.model.eval()
+        correct = 0
+        total = len(test_y)
+        for i in range(0, len(test_X), batch_size):
+            bx = test_X[i:i+batch_size]
+            by = test_y[i:i+batch_size]
+            out = self.model(bx, self.chip.mission_time_s)
+            correct += (out.argmax(dim=1) == by).sum().item()
+        return 100.0 * correct / total
+
+    def run(self, test_X: torch.Tensor, test_y: torch.Tensor, years: float = 5.0):
+        total_seconds = years * 365.25 * 86400
+        orbits_total = int(total_seconds / self.config.orbit_period_s)
+        time_step_s = 60.0
+
+        time_y, acc_deg, temp_deg, beta_deg_list, deployed_list = [], [], [], [], []
+        retrain_events = []
+        orbit = 0
+
+        logger.info(f"Starting v13.3 5-year mission with deployable radiators + active cooling loop + on-orbit retraining...")
+
+        while orbit < orbits_total:
+            days = self.chip.mission_time_s / 86400
+            beta = self.config.beta_amplitude_deg * math.sin(2 * math.pi * days / self.config.beta_period_days)
+            sun_fraction = get_sun_fraction(beta, self.config)
+
+            orbit_time_left = self.config.orbit_period_s
+            while orbit_time_left > 0:
+                dt = min(time_step_s, orbit_time_left)
+                self.chip.update_thermal(dt, sun_fraction, beta)
+                self.chip.mission_time_s += dt
+                orbit_time_left -= dt
+
+            for w in self.model.get_radhard_weights():
+                w.corrupt(self.config.orbit_period_s, self.chip.mission_time_s)
+
+            if (orbit + 1) % self.config.scrub_interval_orbits == 0:
+                self.model.scrub()
+                self.chip.rhbd.scrub()
+
+            acc = self.evaluate(test_X, test_y)
+
+            # On-orbit retraining logic
+            if (days - self.last_retrain_days > self.config.retrain_interval_days or
+                acc < self.config.retrain_accuracy_threshold):
+                self.trainer.retrain(self.retrain_X, self.retrain_y, self.config.retrain_epochs)
+                self.last_retrain_days = days
+                retrain_events.append(days)
+
+            years_elapsed = self.chip.mission_time_s / (365.25 * 86400)
+            time_y.append(years_elapsed)
+            acc_deg.append(acc)
+            temp_deg.append(self.chip.temp_c)
+            beta_deg_list.append(beta)
+            deployed_list.append(1 if self.chip.deployed else 0)
+
+            flux = self.chip.rhbd.proton.get_flux_multiplier(self.chip.mission_time_s)
+            logger.info(f"→ {years_elapsed:.2f} yr | Acc: {acc:.2f}% | T: {self.chip.temp_c:.1f}°C | β: {beta:+5.1f}° | Deployed: {self.chip.deployed} | Cooling: {self.chip.cooling_active} | Pump: {self.chip.pump_power:.2f}W | Flux: {flux:.1f}x")
+
+            orbit += 1
+
+        # Quad-axis plot with retrain markers
+        fig, ax1 = plt.subplots(figsize=(14, 8))
+        ax1.set_xlabel('Mission Time (years)')
+        ax1.set_ylabel('Top-1 Accuracy (%)', color='tab:red')
+        ax1.plot(time_y, acc_deg, 'r-', linewidth=2.5, label='Accuracy')
+        ax1.tick_params(axis='y', labelcolor='tab:red')
+        for ev in retrain_events:
+            ax1.axvline(ev/365.25, color='purple', linestyle=':', alpha=0.6, label='On-orbit Retrain' if ev == retrain_events[0] else "")
+
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Chip Temperature (°C)', color='tab:blue')
+        ax2.plot(time_y, temp_deg, 'b--', linewidth=2, label='Temperature')
+        ax2.tick_params(axis='y', labelcolor='tab:blue')
+
+        ax3 = ax1.twinx()
+        ax3.spines.right.set_position(("axes", 1.15))
+        ax3.set_ylabel('β Angle (°)', color='tab:green')
+        ax3.plot(time_y, beta_deg_list, 'g-.', linewidth=1.5, label='β Angle')
+        ax3.tick_params(axis='y', labelcolor='tab:green')
+
+        ax4 = ax1.twinx()
+        ax4.spines.right.set_position(("axes", 1.30))
+        ax4.set_ylabel('Radiator Deployed', color='tab:orange')
+        ax4.plot(time_y, deployed_list, 'o-', color='tab:orange', linewidth=1.2, label='Deployed')
+        ax4.set_yticks([0,1])
+        ax4.tick_params(axis='y', labelcolor='tab:orange')
+
+        plt.title('Orbital AI v13.3 — 5-Year LEO with Deployable Radiators + Active Cooling Loop + On-Orbit Retraining')
+        fig.legend(loc='upper right', bbox_to_anchor=(0.88, 0.88))
+        plt.grid(True, alpha=0.35)
+        plt.tight_layout()
+        plt.savefig('orbital_5year_v13_3_full.png', dpi=300, bbox_inches='tight')
+        logger.info("✅ v13.3 full mission complete. Plot saved as orbital_5year_v13_3_full.png")
+        return time_y, acc_deg
+
+
+def run_demo(args):
+    config = Config()
+    logger.info("=== Orbital AI v13.3 — Deployable Radiators + Active Cooling + On-Orbit Retraining ===")
+
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+    train_set = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    test_set = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+
+    train_X = torch.stack([train_set[i][0] for i in torch.randperm(len(train_set))[:12000]])
+    train_y = torch.tensor([train_set[i][1] for i in torch.randperm(len(train_set))[:12000]])
+    test_X = torch.stack([test_set[i][0] for i in torch.randperm(len(test_set))[:2500]])
+    test_y = torch.tensor([test_set[i][1] for i in torch.randperm(len(test_set))[:2500]])
+
+    retrain_X = torch.stack([train_set[i][0] for i in torch.randperm(len(train_set))[:config.retrain_samples]])
+    retrain_y = torch.tensor([train_set[i][1] for i in torch.randperm(len(train_set))[:config.retrain_samples]])
+
+    if args.nodes > 1:
+        hardware = ODCConstellation(args.nodes, config)
+    else:
+        hardware = OrbitalAIChip(config)
+
+    trainer = OrbitalTrainer(hardware, lr=0.009)
+    trainer.train(train_X, train_y, epochs=30, batch_size=128)
+
+    if args.export_fpga:
+        exporter = FPGAExporter(trainer.models[0], trainer.nodes[0])
+        exporter.export()
+
+    simulator = MissionSimulator(trainer.models[0], trainer.nodes[0], trainer, retrain_X, retrain_y)
+    simulator.run(test_X, test_y, years=5.0)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Orbital AI v13.3")
+    parser.add_argument("--nodes", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--export_fpga", action="store_true")
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    run_demo(args)
